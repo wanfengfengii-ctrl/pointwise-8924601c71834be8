@@ -1,11 +1,9 @@
-"""SQLite archive v1: whole-batch materialization followed by atomic publication."""
-from dataclasses import dataclass
-import hashlib
+"""SQLite archive v1: bounded staging followed by atomic publication."""
 import sqlite3
 import uuid
 
-from .errors import BatchConflict
-from .qualification import ingest_batch
+from .errors import BatchConflict, IntegrityError
+from .qualification import STAGE_CHUNK, ingest_batch
 from .receipts import Receipt, add_manifest, new_manifest, receipt, valid_id
 
 SCHEMA = """
@@ -35,30 +33,62 @@ PRAGMA user_version=1;
 """
 
 
-@dataclass(frozen=True)
-class PreparedRecord:
-    sequence: int
-    source_order: int
-    record_id: str
-    body: bytes
-    sha256: str
+def _insert_record(connection, batch_id, staging, record, sequence):
+    """Insert one staged body without materialising the batch in Python.
+
+    Bodies up to one bounded chunk are bound directly, so only that chunk is
+    transiently resident.  Larger bodies reserve SQLite's own zeroblob storage
+    and are filled through the incremental blob API one chunk at a time.  No
+    path ever holds a record's whole body alongside another record's body, and
+    no path holds the batch.
+    """
+    if record.size <= STAGE_CHUNK:
+        piece = b''
+        if record.size:
+            piece = next(staging.chunks(record, STAGE_CHUNK), b'')
+            if len(piece) != record.size:
+                raise IntegrityError('staged body length mismatch')
+        connection.execute(
+            'INSERT INTO records VALUES(?,?,?,?,?,?)',
+            (batch_id, sequence, record.source_order, record.record_id,
+             piece, record.sha256))
+        return
+    cursor = connection.execute(
+        'INSERT INTO records VALUES(?,?,?,?,zeroblob(?),?)',
+        (batch_id, sequence, record.source_order, record.record_id,
+         record.size, record.sha256))
+    rowid = cursor.lastrowid
+    target = connection.blobopen('records', 'body', rowid)
+    try:
+        offset = 0
+        for piece in staging.chunks(record, STAGE_CHUNK):
+            if not piece:
+                continue
+            target[offset:offset + len(piece)] = piece
+            offset += len(piece)
+        if offset != record.size:
+            raise IntegrityError('staged body length mismatch')
+    finally:
+        target.close()
 
 
-def prepare(directory, observer):
-    rows = []
+def prepare(staging, observer):
+    """Metadata-only pass: totals, manifest and the body_staged progress port.
+
+    It reads accepted identities from the scratch database without touching a
+    single body byte, so it stays bounded regardless of batch size.
+    """
     manifest = new_manifest()
     total = 0
-    for node in directory.accepted_records():
-        body = bytes(node.body)
-        item = PreparedRecord(len(rows), node.source_order, node.id, body,
-                              hashlib.sha256(body).hexdigest())
-        rows.append(item)
-        total += len(body)
-        add_manifest(manifest, item.sequence, item.source_order, item.record_id,
-                     len(body), item.sha256)
+    count = 0
+    for record in staging.accepted():
+        add_manifest(manifest, count, record.source_order, record.record_id,
+                     record.size, record.sha256)
+        total += record.size
         if observer is not None:
-            observer('body_staged', item.sequence)
-    return rows, total, manifest.hexdigest()
+            observer('body_staged', count)
+        count += 1
+    return count, total, manifest.hexdigest()
 
 
 class Archive:
@@ -95,33 +125,43 @@ class Archive:
         self._check_open()
         return ingest_batch(self, batch_id, events)
 
-    def publish(self, batch_id, directory):
-        """Publish a validated Directory; ingest_batch is the event-facing API."""
+    def publish(self, batch_id, staging):
+        """Publish a validated Staging; ingest_batch is the event-facing API.
+
+        Staging stays owned by ingest_batch, which closes it in a finally; this
+        method only consumes it.  Nothing is committed unless every staged body
+        was written and the observer allowed the round to continue.
+        """
         self._check_open()
         valid_id(batch_id)
-        rows, total, manifest = prepare(directory, self.observer)
+        # Metadata-only pass first: the original implementation emitted
+        # body_staged before opening the publication transaction, including for
+        # replays and conflicts.  Keep that observable ordering.
+        count, total, manifest = prepare(staging, self.observer)
         connection = self._connection
         connection.execute('BEGIN IMMEDIATE')
         try:
             old = receipt(connection, batch_id)
             if old is not None:
-                if old.input_sha256 != directory.input_sha256:
+                if old.input_sha256 != staging.input_sha256:
                     raise BatchConflict('batch ID already has different input')
                 connection.execute('ROLLBACK')
                 return old
             generation = connection.execute(
                 'SELECT COALESCE(MAX(generation),0)+1 FROM batches'
             ).fetchone()[0]
-            result = Receipt(batch_id, directory.input_sha256, generation,
-                             len(rows), total, manifest)
+            result = Receipt(batch_id, staging.input_sha256, generation,
+                             count, total, manifest)
             connection.execute('INSERT INTO batches VALUES(?,?,?,?,?,?)',
                                tuple(result.__dict__.values()))
-            for row in rows:
-                connection.execute('INSERT INTO records VALUES(?,?,?,?,?,?)',
-                                   (batch_id, row.sequence, row.source_order,
-                                    row.record_id, row.body, row.sha256))
+            sequence = 0
+            for record in staging.accepted():
+                _insert_record(connection, batch_id, staging, record, sequence)
                 if self.observer is not None:
-                    self.observer('record_written', row.sequence)
+                    self.observer('record_written', sequence)
+                sequence += 1
+            if sequence != count:
+                raise IntegrityError('staging changed during publication')
             connection.execute(
                 'INSERT INTO current_batch VALUES(1,?) '
                 'ON CONFLICT(singleton) DO UPDATE SET batch_id=excluded.batch_id',
